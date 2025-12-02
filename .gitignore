@@ -1,0 +1,20 @@
+# Created by venv; see https://docs.python.org/3/library/venv.html
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.pywz
+*.pyzw
+*.pyzwz
+*.pyzwzw
+*.pyzwzwz
+*.pyzwzwzw
+*.pyzwzwzwz
+bin/*
+lib/*
+lib64
+include/*
+local/*
+share/*
+example_data/*
