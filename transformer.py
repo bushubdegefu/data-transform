@@ -2,16 +2,53 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from importlib import import_module
 from typing import Any, Callable, Dict, Iterable, Mapping, Type
 
 import pandas as pd
 from sqlalchemy.orm import Session
 
 
+def _resolve_model(model_spec: Any) -> Type:
+    """
+    Resolve a model reference from either:
+
+    - a class/type object (returned as-is)
+    - a string in the form "module.submodule:ClassName"
+
+    This keeps the core transformer generic and free of hard-coded
+    domain imports.
+    """
+    if isinstance(model_spec, type):
+        return model_spec
+
+    if isinstance(model_spec, str):
+        try:
+            module_path, class_name = model_spec.split(":", 1)
+        except ValueError as exc:  # pragma: no cover - defensive
+            raise ValueError(
+                "String model specification must be of the form "
+                "'module.submodule:ClassName'"
+            ) from exc
+
+        module = import_module(module_path)
+        try:
+            return getattr(module, class_name)
+        except AttributeError as exc:  # pragma: no cover - defensive
+            raise ImportError(
+                f"Could not find {class_name!r} in module {module_path!r}"
+            ) from exc
+
+    raise TypeError(
+        f"Unsupported model specification type: {type(model_spec)!r}. "
+        "Use a class or 'module:ClassName' string."
+    )
+
+
 def replace_column_with_lookup(
     df: pd.DataFrame,
     session: Session,
-    model: Type,
+    model: Type | str,
     source_column: str,
     lookup_field: str,
     return_field: str,
@@ -48,8 +85,11 @@ def replace_column_with_lookup(
             df[new_col] = None
         return df
 
+    # Resolve model (class or "module:ClassName" string)
+    model_cls = _resolve_model(model)
+
     # Build filter dynamically: model.lookup_field.in_(source_values)
-    lookup_attr = getattr(model, lookup_field)
+    lookup_attr = getattr(model_cls, lookup_field)
     return_attr = getattr(model, return_field)
 
     results = (
@@ -93,23 +133,115 @@ def add_computed_column(
     return df
 
 
-def add_missing_columns(
-    df: pd.DataFrame,
-    required_columns: Mapping[str, Any],
-) -> pd.DataFrame:
-    """
-    Ensure that all required columns exist in the DataFrame, adding them
-    with default values if missing.
+# def add_missing_columns(
+#     df: pd.DataFrame,
+#     required_columns: Mapping[str, Any],
+# ) -> pd.DataFrame:
+#     """
+#     Ensure that all required columns exist in the DataFrame, adding them
+#     with default values if missing.
 
-    If the default value is callable, it will be called for each row to
-    populate the value (useful for datetime.utcnow, etc.).
+#     If the default value is callable, it will be called for each row to
+#     populate the value (useful for datetime.utcnow, etc.).
+#     """
+#     for col, default in required_columns.items():
+#         if col not in df.columns:
+#             if callable(default):
+#                 df[col] = [default() for _ in range(len(df))]
+#             else:
+#                 df[col] = default
+#     return df
+
+
+def add_missing_columns(df: pd.DataFrame, required_columns: Mapping[str, Any]) -> pd.DataFrame:
+    """
+    Ensure required columns exist and overwrite NaN or None values.
+
+    - Callable defaults (e.g., datetime.utcnow) are called per row.
+    - None defaults become "" (empty string).
+    - Datetime values are converted to ISO strings.
     """
     for col, default in required_columns.items():
+
+        # Always ensure the column exists
         if col not in df.columns:
-            if callable(default):
-                df[col] = [default() for _ in range(len(df))]
-            else:
-                df[col] = default
+            df[col] = None
+
+        # Case 1: default is a callable like datetime.utcnow
+        if callable(default):
+            df[col] = df[col].apply(
+                lambda v: default().isoformat()
+                if pd.isna(v)
+                else (v.isoformat() if isinstance(v, datetime) else v)
+            )
+            continue
+
+        # Case 2: default is None → use empty string ""
+        if default is None:
+            df[col] = df[col].apply(
+                lambda v: ""  if pd.isna(v) or v is None else v
+            )
+            continue
+
+        # Case 3: default is a static value
+        # Convert datetime -> ISO string if needed
+        value = default.isoformat() if isinstance(default, datetime) else default
+
+        # Fill NaN
+        df[col] = df[col].fillna(value)
+
+        # Convert stored datetime objects
+        df[col] = df[col].apply(
+            lambda v: v.isoformat() if isinstance(v, datetime) else v
+        )
+
+    return df
+
+def filter_rows(
+    df: pd.DataFrame,
+    predicate: Callable[[Mapping[str, Any]], bool],
+) -> pd.DataFrame:
+    """
+    Remove rows for which predicate(row) is False.
+
+    The predicate receives a dict-like view of the row.
+    """
+    mask = df.apply(lambda row: bool(predicate(row)), axis=1)
+    return df.loc[mask].reset_index(drop=True)
+
+def replace_column_with_callable(
+    df: pd.DataFrame,
+    column: str,
+    function: Callable[[Mapping[str, Any]], Any],
+) -> pd.DataFrame:
+    """
+    Replace (or create) a column using a callable applied per row.
+
+    The function receives a dict-like view of the row.
+    """
+    df[column] = df.apply(lambda row: function(row), axis=1)
+    return df
+
+def process_column_with_callable(
+    df: pd.DataFrame,
+    column: str,
+    func: Callable[[Any], Any],
+    new_column: str | None = None,
+) -> pd.DataFrame:
+    """
+    Replace values in a column by applying a callable function.
+    
+    Parameters:
+        df: DataFrame
+        column: column to process
+        func: function applied to each cell
+        new_column: optional column name for result
+    """
+    if column not in df.columns:
+        raise KeyError(f"Column {column!r} not found in DataFrame")
+    
+    target_col = new_column or column
+    df[target_col] = df[column].map(func)
     return df
 
 
@@ -120,31 +252,51 @@ class TransformationConfig:
     This is mainly for convenience inside `config.py`.
     """
 
+    # Built-in param-driven steps
+    row_filters: list[Callable[[Mapping[str, Any]], bool]] | None = None
     replace_lookups: list[dict] | None = None
     remove_columns: list[str] | None = None
     computed_columns: list[dict] | None = None
     required_columns: dict | None = None
+    replace_columns: list[dict] | None = None
+    process_rows: list[Callable[[Mapping[str, Any]], bool]] | None = None
+
+    # Fully generic hook: arbitrary callables taking (df, session) -> df
+    custom_steps: list[Callable[[pd.DataFrame, Session], pd.DataFrame]] | None = None
 
     def apply(self, df: pd.DataFrame, session: Session) -> pd.DataFrame:
+        """
+        Apply configured transformations in a simple, generic pipeline:
+
+        0. row_filters
+        1. replace_lookups
+        2. remove_columns
+        3. computed_columns
+        4. required_columns
+        5. custom_steps
+        6. replace_columns
+        7. process_rows
+        """
+
+        # 0. Row filters (drop bad rows early)
+        for predicate in self.row_filters or []:
+            df = filter_rows(df, predicate)
+
         # 1. Replace lookups
         for cfg in self.replace_lookups or []:
-            model = cfg.get("model")
-            if model is None:
+            model_spec = cfg.get("model")
+            if model_spec is None:
                 raise ValueError("TransformationConfig.replace_lookups entry missing 'model'.")
-            if not isinstance(model, type):
-                raise TypeError(
-                    f"'model' in replace_lookups must be a class/type, got {type(model)!r}"
+            if session:
+                df = replace_column_with_lookup(
+                    df=df,
+                    session=session,
+                    model=model_spec,
+                    source_column=cfg["source_column"],
+                    lookup_field=cfg["lookup_field"],
+                    return_field=cfg["return_field"],
+                    new_column_name=cfg.get("new_column_name"),
                 )
-
-            df = replace_column_with_lookup(
-                df=df,
-                session=session,
-                model=model,
-                source_column=cfg["source_column"],
-                lookup_field=cfg["lookup_field"],
-                return_field=cfg["return_field"],
-                new_column_name=cfg.get("new_column_name"),
-            )
 
         # 2. Remove columns
         if self.remove_columns:
@@ -160,43 +312,29 @@ class TransformationConfig:
         if self.required_columns:
             df = add_missing_columns(df, self.required_columns)
 
+        # 5. Arbitrary custom steps
+        for step in self.custom_steps or []:
+            df = step(df, session)
+
+        # 6. Replace columns
+        for cfg in self.replace_columns or []:
+            df = replace_column_with_callable(
+                df=df,
+                column=cfg["column"],
+                function=cfg["function"],
+            ) 
+
+        # proccess columns with callable      
+        for cfg in self.replace_columns or []:
+            df = process_column_with_callable(
+                df=df,
+                column=cfg["column"],
+                func=cfg["func"],
+                new_column=cfg.get("new_column")
+            )   
+
         return df
 
 
-def default_customers_transformation() -> TransformationConfig:
-    """
-    Example transformation configuration for the `customers` table.
-    """
-
-    from models import Customer
-
-    def full_name_func(row: Mapping[str, Any]) -> str:
-        # For this domain, we treat customer_name as the full display name.
-        name = row.get("customer_name") or ""
-        return str(name).strip()
-
-    return TransformationConfig(
-        replace_lookups=[
-            {
-                # Input column coming from Excel/SQL export
-                "source_column": "customer_tin",
-                "model": Customer,
-                # Database column name on the Customer model
-                "lookup_field": "tin_number",
-                "return_field": "id",
-                "new_column_name": "customer_id",
-            }
-        ],
-        remove_columns=["temp_column", "unused_flag"],
-        computed_columns=[
-            {
-                "new_column": "full_name",
-                "function": full_name_func,
-            }
-        ],
-        required_columns={
-            "created_at": datetime.utcnow,
-        },
-    )
 
 
